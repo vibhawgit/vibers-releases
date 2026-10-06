@@ -1,0 +1,121 @@
+# Builds Noma's PC app (Windows installer + Mac app) and publishes it as a release of THIS public repo, where the
+# app checks for updates. It runs here because GitHub Actions minutes are free for public repositories; the code
+# itself stays in the private repo vibhawgit/vibers and is only checked out during the run (it is never printed,
+# and the built installers are public anyway).
+#
+# Run it from this repo's Actions tab: "release" > Run workflow > tag (e.g. v0.4.39). The tag must already exist
+# in vibhawgit/vibers, and package.json there must have the same version.
+#
+# Needs one secret here (Settings > Secrets and variables > Actions):
+#   SOURCE_TOKEN  a fine-grained token with "Contents: Read-only" on vibhawgit/vibers (to check the code out).
+# Mac signing/notarization secrets (optional): MAC_CERT_P12_BASE64, MAC_CERT_PASSWORD, APPLE_ID,
+#   APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID. Without them the Mac app is ad-hoc signed, as before.
+#
+# Flow: a draft release for the tag (reused if one exists) > Windows and Mac build in parallel and upload into it >
+# only when both succeed it is published as the latest release, so a broken build never reaches users.
+name: release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag in vibhawgit/vibers to build, e.g. v0.4.39'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - id: tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Tag must look like v1.2.3"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release $TAG already exists: uploading into it."
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "${TAG#v}" --notes "" --draft
+          fi
+
+  build:
+    needs: draft
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vibhawgit/vibers
+          ref: ${{ needs.draft.outputs.tag }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Version matches the tag
+        shell: bash
+        env:
+          TAG: ${{ needs.draft.outputs.tag }}
+        run: |
+          v=$(node -p "require('./package.json').version")
+          [ "v$v" = "$TAG" ] || { echo "::error::package.json says $v, tag is $TAG"; exit 1; }
+      - run: npm ci
+      - name: Build
+        shell: bash
+        env:
+          CSC_LINK: ${{ runner.os == 'macOS' && secrets.MAC_CERT_P12_BASE64 || '' }}
+          CSC_KEY_PASSWORD: ${{ runner.os == 'macOS' && secrets.MAC_CERT_PASSWORD || '' }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # An empty CSC_LINK is read as a certificate path; drop it when unset.
+          if [ -z "$CSC_LINK" ]; then unset CSC_LINK CSC_KEY_PASSWORD; fi
+          npx electron-vite build
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            npx electron-builder --win nsis --publish never
+          elif [ -n "$CSC_LINK" ]; then
+            npx electron-builder --mac --publish never -c.mac.hardenedRuntime=true -c.mac.notarize=true
+          else
+            npx electron-builder --mac --publish never -c.mac.identity=-
+          fi
+      - name: Upload into the draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.draft.outputs.tag }}
+        run: |
+          shopt -s nullglob
+          files=(release/latest*.yml release/*.exe release/*.dmg release/*.zip release/*.blockmap)
+          [ ${#files[@]} -gt 0 ] || { echo "::error::Nothing was built"; exit 1; }
+          ls -la "${files[@]}"
+          gh release upload "$TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+
+  publish:
+    needs: [draft, build]
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.draft.outputs.tag }}
+        run: |
+          # Both platforms' update files must be there before the app sees the release.
+          names=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          for f in latest.yml latest-mac.yml; do echo "$names" | grep -qx "$f" || { echo "::error::$f is missing"; exit 1; }; done
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
