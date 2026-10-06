@@ -102,6 +102,9 @@ jobs:
           TAG: ${{ needs.draft.outputs.tag }}
         run: |
           shopt -s nullglob
+          # electron-builder names the Windows installer "Noma Setup X.exe", but latest.yml points at "Noma-Setup-X.exe"
+          # (its own publisher swaps spaces for dashes; gh would upload them as dots). Use the dashed names.
+          for f in release/*\ *; do mv "$f" "${f// /-}"; done
           files=(release/latest*.yml release/*.exe release/*.dmg release/*.zip release/*.blockmap)
           [ ${#files[@]} -gt 0 ] || { echo "::error::Nothing was built"; exit 1; }
           ls -la "${files[@]}"
